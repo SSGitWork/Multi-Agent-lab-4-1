@@ -1,96 +1,127 @@
 """
 Lab 4.1 — Instrumented Pipeline
 ================================
-Wrap the three agent nodes from Lab 3.4 with tracing decorators.
-This file is the only place you add @traceable (or equivalent) calls.
-
-Do NOT modify the original pipeline.py from Lab 3.4.
-
-Structure
----------
-Each instrumented node must:
-  1. Call the original node function (imported from pipeline.py).
-  2. Capture token_count and tool_calls from the node's return value
-     or from LangSmith run context.
-  3. Attach span metadata via make_span_metadata().
-  4. Propagate the run_id from state into the child span so LangSmith
-     links it to the root trace.
-
-PipelineState extension
------------------------
-You need to add two fields to PipelineState (define TracedPipelineState
-below — do not edit pipeline.py):
-
-    run_id    : str          # root trace ID, set once in run_pipeline
-    token_log : list[dict]   # one entry per node, appended by each node
+Tracing wrappers around the Lab 3.4 PM and Coder pipeline nodes.
 """
 
-import asyncio
-from typing import Any
+import inspect
+from typing import Any, TypedDict
 
-# -- Import from Lab 3.4 pre-built files (do not modify those files) --------
-from pipeline import (          # noqa: F401  (pipeline.py from Lab 3.4)
+from langgraph.graph import END, StateGraph
+from langsmith import traceable
+from langsmith.run_helpers import get_current_run_tree
+
+from pipeline import (
     PipelineState,
     pm_node as _original_pm_node,
     coder_node as _original_coder_node,
-    build_pipeline,
 )
 from tracing import configure_tracing, make_span_metadata, new_run_id
 
-# Uncomment once you implement tracing.py:
-# from langsmith import traceable
+
+class TracedPipelineState(PipelineState):
+    requirement: str
+    spec: Any | None
+    final_code: str
+    run_id: str
+    token_log: list[dict[str, Any]]
 
 
-# ---------------------------------------------------------------------------
-# Extended state
-# ---------------------------------------------------------------------------
-
-# TODO: define TracedPipelineState that extends PipelineState with
-#       run_id (str) and token_log (list[dict]).
-
-
-# ---------------------------------------------------------------------------
-# Instrumented node wrappers
-# ---------------------------------------------------------------------------
-
-# TODO: implement traced_pm_node(state) -> dict
-#   • Calls _original_pm_node(state)
-#   • Decorates / wraps with @traceable(name="pm_node")
-#   • Attaches make_span_metadata("pm", token_count, tool_calls)
-#   • Appends an entry to state["token_log"]
+def _token_count_from_result(result: dict[str, Any]) -> int:
+    usage = result.get("usage", {})
+    if not isinstance(usage, dict):
+        return 0
+    try:
+        return int(usage.get("total_tokens", 0))
+    except (TypeError, ValueError):
+        return 0
 
 
-# TODO: implement traced_coder_node(state) -> dict
-#   • Calls _original_coder_node(state)
-#   • Decorates / wraps with @traceable(name="coder_node")
-#   • Attaches make_span_metadata("coder", token_count, tool_calls)
-#   • Appends an entry to state["token_log"]
+def _tool_calls_from_result(result: dict[str, Any]) -> int:
+    calls = result.get("tool_calls", 0)
+    if isinstance(calls, list):
+        return len(calls)
+    try:
+        return int(calls)
+    except (TypeError, ValueError):
+        return 0
 
 
-# ---------------------------------------------------------------------------
-# Instrumented pipeline builder
-# ---------------------------------------------------------------------------
+def _attach_current_span_metadata(metadata: dict[str, Any]) -> None:
+    try:
+        run_tree = get_current_run_tree()
+        if run_tree is None:
+            return
+        run_tree.extra.setdefault("metadata", {}).update(metadata)
+    except Exception:
+        pass
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+@traceable(name="pm_node")
+async def traced_pm_node(state: TracedPipelineState) -> dict[str, Any]:
+    result = await _maybe_await(_original_pm_node(state))
+    token_count = _token_count_from_result(result)
+    tool_calls = _tool_calls_from_result(result)
+    metadata = make_span_metadata("pm", token_count, tool_calls)
+    metadata["run_id"] = state["run_id"]
+    _attach_current_span_metadata(metadata)
+    token_log = list(state.get("token_log", []))
+    token_log.append({**make_span_metadata("pm", token_count, tool_calls), "node": "pm_node"})
+    return {**result, "token_log": token_log}
+
+
+@traceable(name="coder_node")
+async def traced_coder_node(state: TracedPipelineState) -> dict[str, Any]:
+    result = await _maybe_await(_original_coder_node(state))
+    token_count = _token_count_from_result(result)
+    tool_calls = _tool_calls_from_result(result)
+    metadata = make_span_metadata("coder", token_count, tool_calls)
+    metadata["run_id"] = state["run_id"]
+    _attach_current_span_metadata(metadata)
+    token_log = list(state.get("token_log", []))
+    token_log.append({**make_span_metadata("coder", token_count, tool_calls), "node": "coder_node"})
+    return {**result, "token_log": token_log}
+
 
 def build_instrumented_pipeline():
-    """
-    Build a LangGraph StateGraph identical to Lab 3.4's build_pipeline()
-    but with traced_pm_node and traced_coder_node substituted in.
+    graph = StateGraph(TracedPipelineState)
+    graph.add_node("pm", traced_pm_node)
+    graph.add_node("coder", traced_coder_node)
+    graph.set_entry_point("pm")
+    graph.add_edge("pm", "coder")
+    graph.add_edge("coder", END)
+    return graph.compile()
 
-    Hint: copy build_pipeline() from pipeline.py and swap the node
-    functions — do not import build_pipeline() and try to patch it.
-    """
-    raise NotImplementedError("Implement build_instrumented_pipeline()")
+
+@traceable(name="instrumented_pipeline")
+async def _invoke_as_root_trace(graph: Any, initial_state: TracedPipelineState) -> dict[str, Any]:
+    return await graph.ainvoke(initial_state)
 
 
 async def run_instrumented_pipeline(requirement: str) -> dict[str, Any]:
     """
-    Entry point called by main.py.
-
-    Steps
-    -----
-    1. Call configure_tracing() to initialise the backend.
-    2. Generate a root run_id with new_run_id().
-    3. Invoke the instrumented pipeline with the initial state.
-    4. Return the final state dict.
+    Configure tracing, create a root run ID, and run the traced graph.
     """
-    raise NotImplementedError("Implement run_instrumented_pipeline()")
+    configure_tracing()
+
+    run_id = new_run_id()
+
+    initial_state: TracedPipelineState = {
+        "requirement": requirement,
+        "spec": None,
+        "final_code": "",
+        "run_id": run_id,
+        "token_log": [],
+    }
+
+    graph = build_instrumented_pipeline()
+
+    # @traceable-decorated wrappers create LangSmith spans automatically
+    # when LANGSMITH_TRACING / LANGCHAIN_TRACING_V2 are enabled.
+    return await graph.ainvoke(initial_state)
